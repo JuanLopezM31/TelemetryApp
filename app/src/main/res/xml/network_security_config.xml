@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Permite tráfico HTTP (sin TLS) únicamente hacia la IP del servidor.
+        El resto de conexiones siguen requiriendo HTTPS.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">3.20.62.117</domain>
+    </domain-config>
+</network-security-config>

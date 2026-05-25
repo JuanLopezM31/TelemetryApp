@@ -38,6 +38,7 @@ import com.example.telemetryapp.ble.BleConnectionState
 import com.example.telemetryapp.ui.components.ConnectionStatusRow
 import com.example.telemetryapp.ui.components.DirectionControls
 import com.example.telemetryapp.viewmodel.GatewayViewModel
+import com.example.telemetryapp.viewmodel.ServerHealthState
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 
@@ -70,10 +71,11 @@ fun GatewayScreen(
     viewModel: GatewayViewModel = viewModel()
 ) {
     // ── Collect StateFlows ────────────────────────────────────────────────────
-    val bleState   by viewModel.bleState.collectAsStateWithLifecycle()
-    val mqttState  by viewModel.mqttState.collectAsStateWithLifecycle()
+    val bleState     by viewModel.bleState.collectAsStateWithLifecycle()
+    val mqttState    by viewModel.mqttState.collectAsStateWithLifecycle()
     val currentRpm by viewModel.currentRpm.collectAsStateWithLifecycle()
-    val speed      by viewModel.speed.collectAsStateWithLifecycle()
+    val speed        by viewModel.speed.collectAsStateWithLifecycle()
+    val serverHealth by viewModel.serverHealth.collectAsStateWithLifecycle()
 
     // ── Permisos BLE dinámicos ────────────────────────────────────────────────
     // Para Android 12+ necesitamos BLUETOOTH_SCAN y BLUETOOTH_CONNECT.
@@ -115,9 +117,10 @@ fun GatewayScreen(
 
             // ── 1. Indicadores de estado ──────────────────────────────────────
             ConnectionStatusRow(
-                bleState = bleState,
-                mqttState = mqttState,
-                modifier = Modifier.fillMaxWidth()
+                bleState     = bleState,
+                mqttState    = mqttState,
+                serverHealth = serverHealth,
+                modifier     = Modifier.fillMaxWidth()
             )
 
             Divider()

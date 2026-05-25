@@ -17,13 +17,22 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import java.net.HttpURLConnection
+import java.net.URL
+
+// Estados posibles del servidor MQTT
+enum class ServerHealthState {
+    UNKNOWN,    // Aún no se ha consultado
+    UP,         // Respondió "OK"
+    DOWN        // No respondió o respondió "DOWN"
+}
 
 class GatewayViewModel(application: Application) : AndroidViewModel(application) {
 
     private val TAG = "GatewayViewModel"
 
     private val bleManager  = BleManager(application.applicationContext)
-    private val mqttManager = MqttManager()
+    private val mqttManager = MqttManager(application.applicationContext)
 
     // ── Estado UI ─────────────────────────────────────────────────────────────
     val bleState  : StateFlow<BleConnectionState>  = bleManager.connectionState
@@ -32,34 +41,84 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     private val _currentRpm = MutableStateFlow(0)
     val currentRpm: StateFlow<Int> = _currentRpm.asStateFlow()
 
-    private val _speed = MutableStateFlow(128)          // Velocidad inicial al 50%
+    private val _speed = MutableStateFlow(128)
     val speed: StateFlow<Int> = _speed.asStateFlow()
 
     private val _direction = MutableStateFlow("STOP")
     val direction: StateFlow<String> = _direction.asStateFlow()
 
-    /**
-     * Job del loop de comando continuo.
-     * Se cancela automáticamente al soltar el botón (stop()).
-     */
-    private var commandLoopJob: Job? = null
+    // ── Server Health ─────────────────────────────────────────────────────────
+    private val _serverHealth = MutableStateFlow(ServerHealthState.UNKNOWN)
+    val serverHealth: StateFlow<ServerHealthState> = _serverHealth.asStateFlow()
 
-    /**
-     * Intervalo de reenvío del comando (ms).
-     * Debe ser MENOR que el WATCHDOG_TIMEOUT_MS del ESP32 (1500ms).
-     * Usamos 500ms → margen amplio de seguridad (3x antes del watchdog).
-     */
+    companion object {
+        const val HEALTHCHECK_URL     = "http://3.20.62.117:8080"
+        const val HEALTHCHECK_POLL_MS = 15_000L   // Consultar cada 15 segundos
+        const val HEALTHCHECK_TIMEOUT = 5_000     // Timeout de conexión en ms
+    }
+
+    private var commandLoopJob    : Job? = null
+    private var healthCheckJob    : Job? = null
     private val COMMAND_REPEAT_MS = 500L
 
     init {
         connectMqtt()
         observeRpmTelemetry()
+        startHealthCheckPolling()   // ← inicia el polling al crear el ViewModel
     }
 
-    private fun connectMqtt() {
-        viewModelScope.launch(Dispatchers.IO) {
-            mqttManager.connect()
+    // ────────────────────────────────────────────────────────────────────────
+    // SERVER HEALTHCHECK
+    // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Consulta GET http://3.20.62.117:8080 cada [HEALTHCHECK_POLL_MS] ms.
+     * Si la respuesta HTTP 200 contiene "OK" → ServerHealthState.UP
+     * Cualquier otro caso (timeout, error, "DOWN") → ServerHealthState.DOWN
+     */
+    private fun startHealthCheckPolling() {
+        healthCheckJob?.cancel()
+        healthCheckJob = viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                _serverHealth.value = checkServerHealth()
+                delay(HEALTHCHECK_POLL_MS)
+            }
         }
+    }
+
+    private fun checkServerHealth(): ServerHealthState {
+        return try {
+            val url = URL(HEALTHCHECK_URL)
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod        = "GET"
+                connectTimeout       = HEALTHCHECK_TIMEOUT
+                readTimeout          = HEALTHCHECK_TIMEOUT
+                instanceFollowRedirects = false
+            }
+
+            val responseCode = conn.responseCode
+            val body = conn.inputStream.bufferedReader().readText().trim()
+            conn.disconnect()
+
+            Log.d(TAG, "Healthcheck → HTTP $responseCode | body: $body")
+
+            if (responseCode == 200 && body.equals("OK", ignoreCase = true)) {
+                ServerHealthState.UP
+            } else {
+                ServerHealthState.DOWN
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Healthcheck falló: ${e.message}")
+            ServerHealthState.DOWN
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // MQTT + BLE (sin cambios)
+    // ────────────────────────────────────────────────────────────────────────
+
+    private fun connectMqtt() {
+        viewModelScope.launch(Dispatchers.IO) { mqttManager.connect() }
     }
 
     private fun observeRpmTelemetry() {
@@ -73,22 +132,14 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // ── BLE ──────────────────────────────────────────────────────────────────
-
     fun startBleScan() {
-        viewModelScope.launch(Dispatchers.IO) {
-            bleManager.startScan()
-        }
+        viewModelScope.launch(Dispatchers.IO) { bleManager.startScan() }
     }
 
     fun disconnectBle() {
         stopCommandLoop()
-        viewModelScope.launch(Dispatchers.IO) {
-            bleManager.disconnect()
-        }
+        viewModelScope.launch(Dispatchers.IO) { bleManager.disconnect() }
     }
-
-    // ── COMANDOS DE MOVIMIENTO ───────────────────────────────────────────────
 
     fun moveForward()  = startCommandLoop(BleConstants.DIR_FORWARD,  "ADELANTE")
     fun moveBackward() = startCommandLoop(BleConstants.DIR_BACKWARD, "ATRÁS")
@@ -97,38 +148,22 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     fun stop() {
         stopCommandLoop()
-        // Enviar STOP una sola vez (no necesita repetición)
         viewModelScope.launch(Dispatchers.IO) {
             bleManager.sendControlCommand(BleConstants.DIR_STOP, 0x00)
-            Log.d(TAG, "STOP enviado")
         }
         _direction.value = "STOP"
     }
 
-    fun updateSpeed(value: Int) {
-        _speed.value = value.coerceIn(0, 255)
-    }
+    fun updateSpeed(value: Int) { _speed.value = value.coerceIn(0, 255) }
 
-    /**
-     * Inicia un loop que reenvía el comando cada [COMMAND_REPEAT_MS] ms
-     * mientras el botón esté presionado.
-     *
-     * Esto alimenta el watchdog del ESP32 (WATCHDOG_TIMEOUT_MS = 1500ms)
-     * evitando que detenga los motores por "pérdida de señal".
-     */
     private fun startCommandLoop(dirByte: Byte, label: String) {
-        // Cancelar cualquier loop anterior antes de iniciar uno nuevo
         stopCommandLoop()
         _direction.value = label
-
         commandLoopJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.d(TAG, "Loop iniciado: $label @ ${_speed.value} PWM")
             while (true) {
-                val speedByte = _speed.value.toByte()
-                bleManager.sendControlCommand(dirByte, speedByte)
+                bleManager.sendControlCommand(dirByte, _speed.value.toByte())
                 delay(COMMAND_REPEAT_MS)
             }
-            // El while(true) se rompe solo cuando el Job es cancelado (stop())
         }
     }
 
@@ -140,6 +175,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         super.onCleared()
         stopCommandLoop()
+        healthCheckJob?.cancel()
         viewModelScope.launch(Dispatchers.IO) {
             bleManager.disconnect()
             mqttManager.disconnect()
